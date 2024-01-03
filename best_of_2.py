@@ -504,3 +504,5 @@ def get_mean_variance_presoftmax_last_layer(a_mean, a_var, n1_mean, n1_var, n2_m
 correct_component_mean, correct_component_var = get_mean_variance_presoftmax_last_layer(postsoftmax_attn_mean, postsoftmax_attn_var, on_diag_mean, on_diagonal_std**2, off_diag_mean, off_diagonal_std**2, eu_mean, eu_std**2)
 incorrect_component_mean, incorrect_component_var = get_mean_variance_presoftmax_last_layer(postsoftmax_attn_mean, postsoftmax_attn_var, off_diag_mean, off_diagonal_std**2, evou_mean, evou_std**2, eu_mean, eu_std**2) #hmm... n2 should be like the mean of evou conditioned on not being the first row or column, which is only off evou.mean() by a second order term? meh i'll ignore this.
 
+
+# %%
