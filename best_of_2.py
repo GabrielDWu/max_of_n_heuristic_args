@@ -2,6 +2,7 @@
 from utils_cleaned import *
 import torch as th
 !wandb login --anonymously
+# model = get_model('2-32')
 model = get_model('2-1500')
 
 torch.set_grad_enabled(False)
@@ -59,10 +60,10 @@ all_sequences = generate_all_sequences(model.cfg.d_vocab, model.cfg.n_ctx)
 # Check `forward` correctly matches `model.forward`
 assert th.allclose(model.forward(all_sequences), forward(model, all_sequences), atol=0.00005)
 
-# Model gets 100% accuracy
+# Model's accuracy
 probs = th.nn.functional.softmax(forward(model, all_sequences), dim=-1)[:, -1]
-print(float((probs.argmax(-1) == all_sequences.max(-1).values).float().mean()))
-print(float(probs[th.arange(len(all_sequences)), all_sequences.max(-1).values].mean()))
+print("Accuracy:", float((probs.argmax(-1) == all_sequences.max(-1).values).float().mean()))
+print("Soft Accuracy:", float(probs[th.arange(len(all_sequences)), all_sequences.max(-1).values].mean()))
 
 # %% [markdown]
 # Get a heuristic estimate for the (soft) accuracy of the model
@@ -73,152 +74,69 @@ W_Q, W_K= model.W_Q, model.W_K
 d_model, d_vocab, n_ctx = model.cfg.d_model, model.cfg.d_vocab, model.cfg.n_ctx
 
 # %%
-# A class for keeping track of a binned distribution
-from collections import defaultdict
+# Quantiled BinnedDist
+import numpy as np
+from scipy.stats import norm
+import matplotlib.pyplot as plt
 
 class BinnedDist:
 
-    def __init__(self, lb, ub, num_bins, bins, lst = None):
-        self.lb = lb
-        self.ub = ub
+    def __init__(self, num_bins, bins=None):
+        """
+        If num_bins = 10, then bins is an array of 10 numbers. The first number is the mean of the bottom 10% of the distribution, etc.
+        """
         self.num_bins = num_bins
-        self.bins = bins
-        self.bin_sz = (ub - lb) / self.num_bins
-        self.lst = lst
+        self.bins = np.array(bins if bins is not None else [0]*num_bins)
 
     @staticmethod
-    def from_list(lst, num_bins, lb=None, ub=None):
-        lb = min(lst) if lb is None else lb
-        ub = max(lst) if ub is None else ub
-        bd = BinnedDist(lb, ub, num_bins, [0]*num_bins, lst)
-        for x in lst:
-            bd.bins[bd.get_bin(x)] += 1 / len(lst)
-        return bd
+    def from_list(lst, num_bins):
+        if num_bins > len(lst):
+            num_bins = len(lst)
+        lst = np.sort(lst)
+        bins = np.zeros(num_bins)
+        ind = 0
+        for i in range(num_bins):
+            bin_sz = len(lst) // num_bins + (1 if i < len(lst) % num_bins else 0)
+            bins[i] = np.mean(lst[ind:ind + bin_sz])
+            ind += bin_sz
+        return BinnedDist(num_bins, bins)
+
 
     @staticmethod 
-    def from_cdf(cdf, num_bins, lb, ub):
-        bd = BinnedDist(lb, ub, num_bins, [0]*num_bins)
-        for i in range(num_bins):
-            bd.bins[i] += cdf(bd.bin_sz * (i+1)+lb) - cdf(bd.bin_sz * i + lb)
-        return bd
+    def from_truncated_expectation(conditional_expectation, num_bins):
+        bins = np.array([conditional_expectation(i / num_bins, (i+1) / num_bins) for i in range(num_bins)])
+        return BinnedDist(num_bins, bins)
     
-    def get_bin(self, x):
-        bin = int((x - self.lb) / self.bin_sz)
-        if bin == self.num_bins: # this is ugly
-            bin -= 1
-        assert 0 <= bin < self.num_bins
-        return bin
+    @staticmethod
+    def from_normal(mu, sigma, num_bins):
+        norm_cond = lambda a, b: mu + sigma * (norm.pdf(norm.ppf(a)) - norm.pdf(norm.ppf(b))) / (b - a)
+        return BinnedDist.from_truncated_expectation(norm_cond, num_bins)
     
-    def get_rep(self, i):
-        """Returns representative (midpoint) of bin i"""
-        assert 0 <= i < self.num_bins
-        return self.lb + (i + .5) * self.bin_sz
-    
-    def plot(self, include_lst=False, **kwargs):
-        plt.bar(np.linspace(self.lb, self.ub, self.num_bins), self.bins, width=self.bin_sz, **kwargs)
-        if include_lst:
-            assert self.lst is not None
-            plt.hist(self.lst, bins=100, alpha=.5)
+    def plot(self, **kwargs):
+        xs = self.bins
+        ys = np.zeros(self.num_bins)
+        ys[1:-1] = 2 / (self.bins[2:] - self.bins[:-2]) / self.num_bins
+        plt.plot(xs, ys, **kwargs)
 
-    def apply_func(self, func, preserve_gt=False):
-        weighted_lst = defaultdict(float)
-        for i, cnt in enumerate(self.bins):
-            weighted_lst[func(self.get_rep(i))] += cnt
-        
-        lb = min(weighted_lst.keys())
-        ub = max(weighted_lst.keys())
-        bd = BinnedDist(lb, ub, self.num_bins, [0]*self.num_bins)
-        for x, cnt in weighted_lst.items():
-            bd.bins[bd.get_bin(x)] += cnt
-        
-        if preserve_gt:
-            assert self.lst is not None
-            bd.lst = list(map(func, self.lst))
-        
-        return bd
+    def apply_func(self, func):
+        new_bins = np.sort(func(self.bins))
+        return BinnedDist(self.num_bins, new_bins)
     
-    def apply_func2(self, func, other_bd, preserve_gt=False):
-        """Approximates the binned distribution of func(self.lst, other_bd.lst) in quadratic time"""
-        weighted_lst = defaultdict(float)
-        for i, cnt_i in enumerate(self.bins):
-            for j, cnt_j in enumerate(other_bd.bins):
-                if cnt_i * cnt_j > 0:
-                    weighted_lst[func(self.get_rep(i), other_bd.get_rep(j))] += cnt_i * cnt_j
-
-        lb = min(weighted_lst.keys())
-        ub = max(weighted_lst.keys())
-        bd = BinnedDist(lb, ub, self.num_bins, [0]*self.num_bins)
-        for x, cnt in weighted_lst.items():
-            bd.bins[bd.get_bin(x)] += cnt
-        
-        if preserve_gt:
-            assert self.lst is not None
-            bd.lst = list([func(x, y) for x in self.lst for y in other_bd.lst])
-        
-        return bd
+    def apply_func2(self, func, other_bd: 'BinnedDist', new_bin_cnt=None):
+        x = self.bins[:, np.newaxis]
+        y = other_bd.bins
+        all_pairs = func(x, y)
+        all_pairs_flat = all_pairs.flatten()
+        bin_count = new_bin_cnt if new_bin_cnt is not None else max(self.num_bins, other_bd.num_bins)
+        return BinnedDist.from_list(all_pairs_flat, bin_count)
     
-    def convolve_with(self, other_bd, preserve_gt=False):
-        return self.apply_func2(lambda x, y: x+y, other_bd, preserve_gt)
+    def convolve_with(self, other_bd):
+        return self.apply_func2(np.add, other_bd)
 
     def mean(self):
-        return sum(self.get_rep(i) * cnt for i, cnt in enumerate(self.bins))
+        return np.mean(self.bins)
 
 
-# %% [markdown]
-# Notice: EVOU is basically identity
-
-EVOU = W_E @ W_V @ W_O @ W_U
-EVOU.squeeze_()
-
-
-on_diagonal = EVOU.diag()
-off_diagonal = th.tensor([EVOU[i, j] for j in range(EVOU.shape[1]) for i in range(EVOU.shape[0]) if i != j])
-
-on_diag_mean = on_diagonal.mean()
-on_diagonal_std = on_diagonal.std()
-off_diag_mean = off_diagonal.mean()
-off_diagonal_std = off_diagonal.std()
-evou_mean = EVOU.mean()
-evou_std = EVOU.std()
-
-if SHOW:
-    plt.imshow(EVOU.detach().cpu().numpy())
-    plt.colorbar()
-    plt.title("EVOU")
-    plt.show()
-    print(f"on_diag_mean: {on_diag_mean}\non_diagonal_std: {on_diagonal_std}\noff_diag_mean: {off_diag_mean}\noff_diagonal_std: {off_diagonal_std}")
-# %% [markdown]
-# Statistics of EU
-
-EU = W_E @ W_U
-EU.squeeze_()
-
-eu_mean = EU.mean()
-eu_std = EU.std()
-
-if SHOW:
-    plt.imshow(EU.detach().cpu().numpy())
-    plt.colorbar()
-    plt.title("EU")
-    plt.show()
-    print(f"eu_mean: {eu_mean}\neu_std: {eu_std}")
-
-plt.hist(EU.detach().cpu().numpy().flatten(), bins=100, alpha=.5)
-# %% [markdown]
-# Make necessary binned distributions
-BINS = 100
-evou_off_diag_dist = BinnedDist.from_list(list(off_diagonal), BINS)
-resids = []
-for i in range(EVOU.shape[0]):
-    for j in range(EVOU.shape[1]):
-        if i != j:
-            resids.append((EVOU[i, j] - EVOU[i, i]).item())
-evou_resid_dist = BinnedDist.from_list(resids, BINS)
-eu_dist = BinnedDist.from_list(list(EU.flatten().detach().numpy()), BINS)
-
-## This needs to be fixed to VOU * W_pos
-pos_enc_dist = BinnedDist.from_list(list((W_pos @ W_V @ W_O @ W_U).flatten().detach().numpy()), BINS)
-evou_dist = BinnedDist.from_list(list(EVOU.flatten().detach().numpy()), BINS)
 # %% [markdown]
 # Notice: SVD of QK has big first element and small rest
 
@@ -311,58 +229,59 @@ if SHOW:
     print(f"presoftmax_attn_diff_mean: {presoftmax_attn_diff_mean}\npresoftmax_attn_diff_std: {presoftmax_attn_diff_std}")
 
 # %% [markdown]
-# Visualize how close our approximation is to the actual distribution of pre-softmax attention difference
-def get_actual_presoftmax_attn(model, input):
+def visualize_error_in_presoftmax_attn_diff():
+    # Visualize how close our approximation is to the actual distribution of pre-softmax attention difference
+    def get_actual_presoftmax_attn(model, input):
 
-    if th.is_floating_point(input):
-        x = input[(None,) * (3 - input.ndim)]
-    else:
-        x = input[(None,) * (2 - input.ndim)]
-        x = th.nn.functional.one_hot(x, num_classes=model.cfg.d_vocab).float()
+        if th.is_floating_point(input):
+            x = input[(None,) * (3 - input.ndim)]
+        else:
+            x = input[(None,) * (2 - input.ndim)]
+            x = th.nn.functional.one_hot(x, num_classes=model.cfg.d_vocab).float()
 
-    x = x @ model.W_E
-    x = x + model.W_pos[None, : x.shape[-2]]
+        x = x @ model.W_E
+        x = x + model.W_pos[None, : x.shape[-2]]
 
-    Q = x[:, None] @ model.W_Q[None, 0]
-    K = x[:, None] @ model.W_K[None, 0]
-    V = x[:, None] @ model.W_V[None, 0]
+        Q = x[:, None] @ model.W_Q[None, 0]
+        K = x[:, None] @ model.W_K[None, 0]
+        V = x[:, None] @ model.W_V[None, 0]
 
-    return Q @ K.transpose(-2, -1)
+        return Q @ K.transpose(-2, -1)
 
-all_attns = get_actual_presoftmax_attn(model, all_sequences).squeeze()
-diffs = all_attns[:, 1, 0] - all_attns[:, 1, 1]
-diffs[all_sequences[:, 0] < all_sequences[:, 1]] *= -1
-diffs = diffs[all_sequences[:, 0] != all_sequences[:, 1]]
+    all_attns = get_actual_presoftmax_attn(model, all_sequences).squeeze()
+    diffs = all_attns[:, 1, 0] - all_attns[:, 1, 1]
+    diffs[all_sequences[:, 0] < all_sequences[:, 1]] *= -1
+    diffs = diffs[all_sequences[:, 0] != all_sequences[:, 1]]
 
-if SHOW:
-    print(f"actual_diff_mean: {diffs.mean()}\nactual_diff_std: {diffs.std()}")
+    if SHOW:
+        print(f"actual_diff_mean: {diffs.mean()}\nactual_diff_std: {diffs.std()}")
 
-# This is very much not normally distributed...
+    # This is very much not normally distributed...
 
-# Simulate our approximation
-from random import randint, normalvariate
-def get_draw():
-    xmin, xmax = 0, 0
-    while(xmin == xmax):
-        xmin = randint(0, d_vocab - 1)
-        xmax = randint(0, d_vocab - 1)
-    if xmin > xmax:
-        xmin, xmax = xmax, xmin
+    # Simulate our approximation
+    from random import randint, normalvariate
+    def get_draw():
+        xmin, xmax = 0, 0
+        while(xmin == xmax):
+            xmin = randint(0, d_vocab - 1)
+            xmax = randint(0, d_vocab - 1)
+        if xmin > xmax:
+            xmin, xmax = xmax, xmin
 
-    ans = first_singular_value * normalvariate(query_proj_mean, query_proj_std) * normalvariate(consec_key_diffs_mean * (xmax - xmin), consec_key_diffs_std * (xmax - xmin)**.5) # most of the work going on here
+        ans = first_singular_value * normalvariate(query_proj_mean, query_proj_std) * normalvariate(consec_key_diffs_mean * (xmax - xmin), consec_key_diffs_std * (xmax - xmin)**.5) # most of the work going on here
 
-    for _ in range(1, d_vocab):
-        ans += normalvariate(other_singular_values_mean, other_singular_values_std) * normalvariate(other_U_mean, other_U_std) * normalvariate(0, other_V_std * 2**.5)
-    ans += normalvariate(0, positional_adjustment_std)
+        for _ in range(1, d_vocab):
+            ans += normalvariate(other_singular_values_mean, other_singular_values_std) * normalvariate(other_U_mean, other_U_std) * normalvariate(0, other_V_std * 2**.5)
+        ans += normalvariate(0, positional_adjustment_std)
 
-    return ans
+        return ans
 
-draws = [get_draw() for _ in range(diffs.shape[0])]
-draws = torch.tensor(draws)
-if SHOW:
-    plt.hist(draws.detach().cpu().numpy(), bins=100, alpha=.5)
-    plt.hist(diffs.detach().cpu().numpy(), bins=100, alpha=.5)
-    plt.legend(["Simulated", "Actual"])
+    draws = [get_draw() for _ in range(diffs.shape[0])]
+    draws = torch.tensor(draws)
+    if SHOW:
+        plt.hist(draws.detach().cpu().numpy(), bins=100, alpha=.5)
+        plt.hist(diffs.detach().cpu().numpy(), bins=100, alpha=.5)
+        plt.legend(["Simulated", "Actual"])
 
 # %% [markdown]
 # Functions to estimate E[f(X)] using a Taylor approximation of f around X
@@ -435,16 +354,61 @@ postsoftmax_attn_var = postsoftmax_attn_2nd_moment - postsoftmax_attn_mean ** 2 
 
 if SHOW:
     print(f"postsoftmax_attn_mean:{postsoftmax_attn_mean}\npostsoftmax_attn_var:{postsoftmax_attn_var}")
+
+# %% [markdown]
+# Notice: EVOU is basically identity
+
+EVOU = W_E @ W_V @ W_O @ W_U
+EVOU.squeeze_()
+
+
+on_diagonal = EVOU.diag()
+off_diagonal = th.tensor([EVOU[i, j] for j in range(EVOU.shape[1]) for i in range(EVOU.shape[0]) if i != j])
+
+on_diag_mean = on_diagonal.mean()
+on_diagonal_std = on_diagonal.std()
+off_diag_mean = off_diagonal.mean()
+off_diagonal_std = off_diagonal.std()
+evou_mean = EVOU.mean()
+evou_std = EVOU.std()
+
+if SHOW:
+    plt.imshow(EVOU.detach().cpu().numpy())
+    plt.colorbar()
+    plt.title("EVOU")
+    plt.show()
+    print(f"on_diag_mean: {on_diag_mean}\non_diagonal_std: {on_diagonal_std}\noff_diag_mean: {off_diag_mean}\noff_diagonal_std: {off_diagonal_std}")
+
+
+# %% [markdown]
+# Make necessary binned distributions
+BINS = 100
+resids = []
+for i in range(EVOU.shape[0]):
+    for j in range(EVOU.shape[1]):
+        if i != j:
+            resids.extend([(EVOU[i, j] - EVOU[i, i]).item()] * (2*i+1))
+evou_resid_dist = BinnedDist.from_list(resids, BINS)
+evou_off_diag_dist = BinnedDist.from_list(list(off_diagonal), BINS)
+EU = W_E @ W_U
+EU.squeeze_()
+eu_dist = BinnedDist.from_list(list(EU.flatten().detach().numpy()), BINS)
+
+pos_enc_contrib_through_attention_dist = BinnedDist.from_list(list((W_pos @ W_V @ W_O @ W_U).flatten().detach().numpy()), BINS)
+evou_dist = BinnedDist.from_list(list(EVOU.flatten().detach().numpy()), BINS)
+evou_diag_dist = BinnedDist.from_list(list(EVOU.diag().detach().numpy()), BINS)
 # %% [markdown]
 # Estimate the final output distribution
 
 import scipy.stats as stats
-from math import exp
 
-if postsoftmax_attn_var == 0: # Handle degenerate case
-    a_dist = BinnedDist.from_cdf(lambda x: 1 if x>=postsoftmax_attn_mean else 0, BINS, float(postsoftmax_attn_mean-1e-6), float(postsoftmax_attn_mean+1e-6))
+torch.set_grad_enabled(False)
+if postsoftmax_attn_var <= 0: # Handle degenerate case
+    # a_dist = BinnedDist.from_cdf(lambda x: 1 if x>=postsoftmax_attn_mean else 0, BINS, float(postsoftmax_attn_mean-1e-6), float(postsoftmax_attn_mean+1e-6))
+    a_dist = BinnedDist.from_normal(float(postsoftmax_attn_mean), float(1e-6), BINS)
 else:
-    a_dist = BinnedDist.from_cdf(lambda x: stats.norm.cdf(x, loc=postsoftmax_attn_mean, scale=postsoftmax_attn_var**.5), BINS, float(postsoftmax_attn_mean - 10 * (postsoftmax_attn_var**.5)), float(postsoftmax_attn_mean + 10 * (postsoftmax_attn_var**.5)))
+    a_dist = BinnedDist.from_normal(postsoftmax_attn_mean, postsoftmax_attn_var**.5, BINS)
+#     a_dist = BinnedDist.from_cdf(lambda x: stats.norm.cdf(x, loc=postsoftmax_attn_mean, scale=postsoftmax_attn_var**.5), BINS, float(postsoftmax_attn_mean - 10 * (postsoftmax_attn_var**.5)), float(postsoftmax_attn_mean + 10 * (postsoftmax_attn_var**.5)))
 
 correct_logit_dist = evou_off_diag_dist.convolve_with(pos_enc_dist).apply_func2(lambda x, a: x*(1-a), a_dist).convolve_with(eu_dist)
 incorrect_logit_dist = evou_resid_dist.convolve_with(pos_enc_dist).apply_func2(lambda x, a: x*a, a_dist).convolve_with(
@@ -452,8 +416,9 @@ incorrect_logit_dist = evou_resid_dist.convolve_with(pos_enc_dist).apply_func2(l
 ).convolve_with(eu_dist)
 
 
-exp_correct_logit_dist = correct_logit_dist.apply_func(lambda x: exp(x))
-exp_incorrect_logit_dist = incorrect_logit_dist.apply_func(lambda x: exp(x))
+exp_correct_logit_dist = correct_logit_dist.apply_func(np.exp)
+exp_incorrect_logit_dist = incorrect_logit_dist.apply_func(np.exp)
+
 
 
 # Now, convolve exp_incorrect_logit_dist with itself d_vocab-1 times, using binary lifting
@@ -476,33 +441,144 @@ if SHOW:
     plt.title("Estimated Final output distribution")
     print(f"estimated accuracy: {final_output_dist.mean()}")
 
-# %% [markdown]
-## OLD WORK BELOW
 # %%
-# No longer in use.
 
-### Estimate the final difference in logits between the right answer and the wrong answer
-# Let $A \in [0, 1]$ be the amount of attention placd on the correct token. Then, the output probabilities is:
-# $$\mathrm{softmax}(A x_{max} \cdot EVOU + (1-A) x_{min} \cdot EVOU + x_2 EU)$$
-# We first assume that $A$, all of the entries of $x_{max} \cdot EVOU$, all of the entries of $x_{min} \cdot EVOU$, and all of the entries of $x_2 EU$ are independent and normal with their respective mean and variance. We then calculate the mean and variance of each component under this assumption. (note that all `d_vocab`-1 incorrect components end up with the same mean and variance).
-# Next, we assume all of these components are independent normals. We then have to calculate the expected value of the softmax. To do this, we use a bucketing strategy: keep track of eps-sized buckets of each PDF to calculate the PDF of the answer.
+def forward_attn_1(model, input, *, hook_fn=None):
+    """Assume attention is always correctly placed 100% on correct token"""
+    def hook(key, x):
+        if hook_fn is None:
+            return x
+        new_x = hook_fn(key, x)
+        return x if new_x is None else new_x
 
-def get_mean_variance_presoftmax_last_layer(a_mean, a_var, n1_mean, n1_var, n2_mean, n2_2var, n3_mean, n3_var):
-    """
-    Let L = A * N_1 + (1-A) * N_2 + N_3, where A, N_1, N_2, N_3 are independent normals with the given means and variances.
-    Returns E[L] and Var[L]
-    """
-    EL = a_mean * n1_mean + (1-a_mean) * n2_mean + n3_mean
-    a_2nd = a_var + a_mean**2
-    n1_2nd = n1_var + n1_mean**2
-    n2_2nd = n2_2var + n2_mean**2
-    n3_2nd = n3_var + n3_mean**2
+    if th.is_floating_point(input):
+        x = input[(None,) * (3 - input.ndim)]
+    else:
+        x = input[(None,) * (2 - input.ndim)]
+        x = th.nn.functional.one_hot(x, num_classes=model.cfg.d_vocab).float()
 
-    EL2 = a_2nd * n1_2nd + (1 - 2*a_mean + a_2nd) * n2_2nd + n3_2nd + 2 * (a_mean - a_2nd) * n1_mean * n2_mean + 2 * a_mean * n1_mean * n3_mean + 2 * (1-a_mean) * n2_mean * n3_mean
-    return EL, EL2 - EL**2
+    x = x.to(model.W_E.device)
+    x = x @ model.W_E
+    x = hook("embed", x)
+    x = x + model.W_pos[None, : x.shape[-2]]
+    x = hook("attn_block_pre", x)
 
-correct_component_mean, correct_component_var = get_mean_variance_presoftmax_last_layer(postsoftmax_attn_mean, postsoftmax_attn_var, on_diag_mean, on_diagonal_std**2, off_diag_mean, off_diagonal_std**2, eu_mean, eu_std**2)
-incorrect_component_mean, incorrect_component_var = get_mean_variance_presoftmax_last_layer(postsoftmax_attn_mean, postsoftmax_attn_var, off_diag_mean, off_diagonal_std**2, evou_mean, evou_std**2, eu_mean, eu_std**2) #hmm... n2 should be like the mean of evou conditioned on not being the first row or column, which is only off evou.mean() by a second order term? meh i'll ignore this.
+    Q = x[:, None] @ model.W_Q[None, 0] + model.b_Q[None, 0].unsqueeze(-2)
+    K = x[:, None] @ model.W_K[None, 0] + model.b_K[None, 0].unsqueeze(-2)
+    V = x[:, None] @ model.W_V[None, 0] + model.b_V[None, 0].unsqueeze(-2)
+    Q = hook("Q", Q)
+    K = hook("K", K)
+    V = hook("V", V)
+
+    d_k = model.W_K.shape[-1]
+    attn_1 = torch.zeros_like(Q @ K.transpose(-2,-1))
+    # places 1 attn on correct answer
+    attn_1[:, 0, 1, 0] = all_sequences[:, 0] > all_sequences[:, 1]
+    attn_1[:, 0, 1, 1] = all_sequences[:, 0] <= all_sequences[:, 1]
 
 
+    # attn = masked_softmax(Q @ K.transpose(-2, -1) / d_k**0.5) @ V
+    attn = attn_1 @ V
+    attn = hook("attn_z", attn)
+    attn = (attn @ model.W_O[None, 0]).sum(-3) + model.b_O[None, 0].unsqueeze(-2)
+    attn = hook("attn_result", attn)
+    x = x + attn
+
+    x = hook("attn_block_post", x)
+    x = x @ model.W_U + model.b_U[None, None]
+
+    return x
+
+# Model's accuracy
+probs = th.nn.functional.softmax(forward_attn_1(model, all_sequences), dim=-1)[:, -1]
+print("Accuracy:", float((probs.argmax(-1) == all_sequences.max(-1).values).float().mean()))
+print("Soft Accuracy:", float(probs[th.arange(len(all_sequences)), all_sequences.max(-1).values].mean()))
+# %%
+from random import randint
+def exact_tree(x1, x2):
+    """Should emulate exactly what the model does"""
+    # x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
+    correct_loc = 1 if x2 >= x1 else 0
+    i, j = max(x1, x2), min(x1, x2)
+    E, V, O, U = W_E.squeeze(), W_V.squeeze(), W_O.squeeze(), W_U.squeeze()
+    correct_logit = EVOU[i,i] + (W_pos[correct_loc] @ V @ O @ U)[i] + (E @ U)[x2, i] + (W_pos[1] @ U)[i]
+    incorrect_logits = [EVOU[i,k] + (W_pos[correct_loc] @ V @ O @ U)[k] + (E @ U)[x2, k] + (W_pos[1] @ U)[k] for k in range(d_vocab) if k != i]
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+sum([exact_tree(x1, x2) for x1, x2 in all_sequences]) / len(all_sequences) #Yup, this gets 94% as expected.
+# %%
+
+def no_pos(x1, x2):
+    """no positional bias or direct cotribution"""
+    # x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
+    correct_loc = 1 if x2 >= x1 else 0
+    i, j = max(x1, x2), min(x1, x2)
+    E, V, O, U = W_E.squeeze(), W_V.squeeze(), W_O.squeeze(), W_U.squeeze()
+    correct_logit = EVOU[i,i] 
+    incorrect_logits = [EVOU[i,k] for k in range(d_vocab) if k != i]
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+sum([no_pos(x1, x2) for x1, x2 in all_sequences]) / len(all_sequences) #Yup, gets 91%, so not the main source of error
+
+# %%
+def no_pos_independent_k():
+    x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
+    i, j = max(x1, x2), min(x1, x2)
+    correct_logit = EVOU[i,i] 
+    incorrect_logits = []
+    for _ in range(d_vocab-1):
+        k = randint(0, d_vocab-1)
+        while k == i:
+            k = randint(0, d_vocab-1)
+        incorrect_logits.append(EVOU[i,k])
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+trials = 10000
+sum([no_pos_independent_k() for _ in range(trials)]) / trials # also 92%, so not a source of error.
+# %%
+def no_pos_independent_k_from_i():
+    x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
+    i, j = max(x1, x2), min(x1, x2)
+    correct_logit = EVOU[i,i] 
+    incorrect_logits = []
+    for _ in range(d_vocab-1):
+        k = randint(0, d_vocab-1)
+        ip = (randint(1, d_vocab-1) + k)%d_vocab
+        incorrect_logits.append(EVOU[ip,k])
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+
+sum([no_pos_independent_k_from_i() for _ in range(trials)]) / trials # 84%
+# %%
+def no_pos_independent_k_subtract_i():
+    x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
+    correct_logit = 0
+    incorrect_logits = []
+    for _ in range(d_vocab-1):
+        k = randint(0, d_vocab-1)
+        ip = (randint(1, d_vocab-1) + k)%d_vocab
+        incorrect_logits.append(EVOU[ip,k] - EVOU[ip, ip])
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+
+sum([no_pos_independent_k_subtract_i() for _ in range(trials)]) / trials # 48%
+# %%
+def no_pos_independent_k_subtract_i_weight_ip():
+    x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
+    correct_logit = 0
+    incorrect_logits = []
+    for _ in range(d_vocab-1):
+        ip = max(randint(0, d_vocab-1), randint(0, d_vocab-1))
+        k = (randint(1, d_vocab-1) + ip)%d_vocab
+        incorrect_logits.append(EVOU[ip,k] - EVOU[ip, ip])
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+
+sum([no_pos_independent_k_subtract_i_weight_ip() for _ in range(trials)]) / trials # 85%
+# %%
+def no_pos_independent_k_uniform_i():
+    i = randint(0, d_vocab-1)
+    correct_logit = EVOU[i,i] 
+    incorrect_logits = []
+    for _ in range(d_vocab-1):
+        k = randint(0, d_vocab-1)
+        ip = (randint(1, d_vocab-1) + k)%d_vocab
+        incorrect_logits.append(EVOU[ip,k])
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+trials = 10000
+sum([no_pos_independent_k_uniform_i() for _ in range(trials)]) / trials #74%
 # %%

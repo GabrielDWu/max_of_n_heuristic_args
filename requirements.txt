@@ -1,9 +1,0 @@
-einops
-fancy_einsum
-transformer_lens
-numpy==1.24.1
-wandb==0.15.12
-matplotlib
-scipy
-pytest
-plotly

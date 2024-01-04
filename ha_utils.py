@@ -1,3 +1,5 @@
+# Utils specific to a heuristic argument. CURRENTLY UNUSED
+
 # A class for keeping track of a binned distribution
 from collections import defaultdict
 from matplotlib import pyplot as plt
