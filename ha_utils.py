@@ -91,3 +91,57 @@ class BinnedDist:
 
     def mean(self):
         return sum(self.get_rep(i) * cnt for i, cnt in enumerate(self.bins))
+
+
+
+# Functions to estimate E[f(X)] using a Taylor approximation of f around X
+import torch
+from math import factorial
+from scipy.special import comb
+ell = 2 # The number of terms of the taylor expansion we're using
+
+torch.set_grad_enabled(True)
+
+
+def get_derivatives(func, num_derivatives, center):
+    if type(center) != torch.Tensor:
+        center = torch.tensor(center)
+    assert center.shape == (), "center must be a scalar"
+    center = center.clone().detach().requires_grad_(True)
+
+    derivatives = [func(center)]
+    for _ in range(1, num_derivatives + 1):
+        # Compute the i-th derivative
+        grad = torch.autograd.grad(derivatives[-1], center, create_graph=True)[0]
+        derivatives.append(grad)
+
+    return [d.item() for d in derivatives]
+
+def expected_taylor(func, num_derivatives, moments, central=False, mean=None):
+    """
+    Moments is a list of the moments of X, where moments[i] = E[(X-E[X])^i] if central==True, else moments[i] = E[X^i]. If central==True, you should also specify the mean.
+    Approximates func(x) as C_0 + C_1 (x-E[x]) + C_2 (x-E[x])^2 + ..., going up to C_{num_derivatives}. Then takes the expectation of this polynomial.
+    """
+    assert central == (mean is not None)
+    assert num_derivatives > 0
+    assert num_derivatives == len(moments)-1
+    assert moments[0] == 1
+
+    if mean is None:
+        mean = moments[1]
+
+    derivatives = get_derivatives(func, num_derivatives, mean)
+    C = [derivatives[i] / factorial(i) for i in range(num_derivatives + 1)]
+
+    if central:
+        central_moments = moments
+    else:
+        # Compute central moments from moments
+        # central_moment[i] = E[(X-E[X])^i]
+        central_moments = [1]
+        for i in range(1, num_derivatives+1):
+            central_moments.append(0)
+            for j in range(i + 1):
+                central_moments[i] += comb(i, j) * (-moments[0])**j * moments[i+1-j]
+    return sum(C[i] * central_moments[i] for i in range(num_derivatives+1))
+

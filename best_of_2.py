@@ -1,9 +1,10 @@
 # %%
+from collections import defaultdict
 from utils_cleaned import *
 import torch as th
 !wandb login --anonymously
-# model = get_model('2-32')
-model = get_model('2-1500')
+model = get_model('2-32')
+# model = get_model('2-1500')
 
 torch.set_grad_enabled(False)
 # %%
@@ -44,7 +45,9 @@ def forward(model, input, *, hook_fn=None):
     V = hook("V", V)
 
     d_k = model.W_K.shape[-1]
-    attn = masked_softmax(Q @ K.transpose(-2, -1) / d_k**0.5) @ V
+    attn_prob = masked_softmax(Q @ K.transpose(-2, -1) / d_k**0.5)
+    attn_prob = hook("attn_prob", attn_prob)
+    attn = attn_prob @ V
     attn = hook("attn_z", attn)
     attn = (attn @ model.W_O[None, 0]).sum(-3) + model.b_O[None, 0].unsqueeze(-2)
     attn = hook("attn_result", attn)
@@ -55,6 +58,7 @@ def forward(model, input, *, hook_fn=None):
 
     return x
 # %%
+
 all_sequences = generate_all_sequences(model.cfg.d_vocab, model.cfg.n_ctx)
 
 # Check `forward` correctly matches `model.forward`
@@ -67,9 +71,10 @@ print("Soft Accuracy:", float(probs[th.arange(len(all_sequences)), all_sequences
 
 # %% [markdown]
 # Get a heuristic estimate for the (soft) accuracy of the model
-SHOW = True
+SHOW = False
 W_U, W_E, W_pos, W_V, W_O = model.W_U, model.W_E, model.W_pos, model.W_V, model.W_O
 W_Q, W_K= model.W_Q, model.W_K
+BINS = 100
 
 d_model, d_vocab, n_ctx = model.cfg.d_model, model.cfg.d_vocab, model.cfg.n_ctx
 
@@ -89,16 +94,48 @@ class BinnedDist:
         self.bins = np.array(bins if bins is not None else [0]*num_bins)
 
     @staticmethod
-    def from_list(lst, num_bins):
-        if num_bins > len(lst):
-            num_bins = len(lst)
+    def from_list(lst):
+        assert len(lst) > 0
+        num_bins = len(lst)
         lst = np.sort(lst)
+        bins = np.array(lst)
+        return BinnedDist(num_bins, bins)
+
+    @staticmethod
+    def from_weighted_list(lst, num_bins, equal_weight=False):
+        """lst is a bunch of pairs (x, w) where x is a number and w is its weight.
+        when equal_weight=True, lst is just the x values"""
+        assert len(lst) > 0
+        if equal_weight:
+            lst = [(x, 1/len(lst)) for x in lst]
+        else:
+            # normalize weights
+            total_weight = sum(w for _, w in lst)
+            for i in range(len(lst)):
+                lst[i] = (lst[i][0], lst[i][1] / total_weight)
+
+        lst = sorted(lst)
         bins = np.zeros(num_bins)
         ind = 0
+        curr_moment = 0
+        curr_weight = 0
         for i in range(num_bins):
-            bin_sz = len(lst) // num_bins + (1 if i < len(lst) % num_bins else 0)
-            bins[i] = np.mean(lst[ind:ind + bin_sz])
-            ind += bin_sz
+            while curr_weight < 1/num_bins:
+                if ind >= len(lst):
+                    assert abs(1/num_bins - curr_weight) < 1e-6, f"curr_weight = {curr_weight} != {1/num_bins} = 1/num_bins"
+                    break
+                if lst[ind][1] + curr_weight < 1/num_bins:
+                    curr_moment += lst[ind][0] * lst[ind][1]
+                    curr_weight += lst[ind][1]
+                    ind += 1
+                else:
+                    curr_moment += lst[ind][0] * (1/num_bins - curr_weight)
+                    lst[ind] = (lst[ind][0], lst[ind][1] - (1/num_bins - curr_weight))
+                    curr_weight = 1/num_bins
+                    break
+            bins[i] = curr_moment * num_bins
+            curr_moment = 0
+            curr_weight = 0
         return BinnedDist(num_bins, bins)
 
 
@@ -111,6 +148,16 @@ class BinnedDist:
     def from_normal(mu, sigma, num_bins):
         norm_cond = lambda a, b: mu + sigma * (norm.pdf(norm.ppf(a)) - norm.pdf(norm.ppf(b))) / (b - a)
         return BinnedDist.from_truncated_expectation(norm_cond, num_bins)
+    
+    @staticmethod
+    def constant(c):
+        return BinnedDist(1, np.array([c]))
+    
+    @staticmethod
+    def mixture(bd1: 'BinnedDist', bd2: 'BinnedDist', p, num_bins=None):
+        """Mixture of bd1 and bd2, with probability p of bd1 and 1-p of bd2"""
+        weighted_lst = [(x, p / bd1.num_bins) for x in bd1.bins] + [(x, (1-p) / bd2.num_bins) for x in bd2.bins]
+        return BinnedDist.from_weighted_list(weighted_lst, num_bins=num_bins if num_bins is not None else max(bd1.num_bins, bd2.num_bins))
     
     def plot(self, **kwargs):
         xs = self.bins
@@ -127,11 +174,34 @@ class BinnedDist:
         y = other_bd.bins
         all_pairs = func(x, y)
         all_pairs_flat = all_pairs.flatten()
-        bin_count = new_bin_cnt if new_bin_cnt is not None else max(self.num_bins, other_bd.num_bins)
-        return BinnedDist.from_list(all_pairs_flat, bin_count)
+        bin_count = new_bin_cnt if new_bin_cnt is not None else min(len(all_pairs_flat), BINS)
+        return BinnedDist.from_weighted_list(all_pairs_flat, bin_count, equal_weight=True)
+
+    def __add__(self, other):
+        return self.apply_func2(np.add, other)
+
+    def __mul__(self, other):
+        return self.apply_func2(np.multiply, other)
     
-    def convolve_with(self, other_bd):
-        return self.apply_func2(np.add, other_bd)
+    def __sub__(self, other):
+        return self.apply_func2(np.subtract, other)
+    
+    def __neg__(self):
+        return self.apply_func(np.negative)
+    
+    @staticmethod
+    def convolve_n_times(dist, n):
+        """Convolve with itself n times, O(log n) using 'square and multiply'"""
+        assert n > 1
+        to_convolve = []
+        curr_dist = dist
+        curr_power = 1
+        while curr_power <= n:
+            if curr_power & n:
+                to_convolve.append(curr_dist)
+            curr_dist += curr_dist
+            curr_power <<= 1
+        return sum(to_convolve[1:], start=to_convolve[0])
 
     def mean(self):
         return np.mean(self.bins)
@@ -153,37 +223,34 @@ torch.testing.assert_close(torch.eye(d_vocab), U @ U.T, atol=0.0001, rtol=0.0001
 torch.testing.assert_close(torch.eye(d_vocab), V @ V.T, atol=0.0001, rtol=0.0001)
 
 key_direction, query_direction = V[:, 0], U[:, 0]
-other_V_mean = V[:, 1:].flatten().mean()
-other_V_std = V[:, 1:].flatten().std()
-other_U_mean = U[:, 1:].flatten().mean()
-other_U_std = U[:, 1:].flatten().std()
+other_V_dist = BinnedDist.from_weighted_list(V[:, 1:].flatten(), BINS, equal_weight=True)
+other_U_dist = BinnedDist.from_weighted_list(U[:, 1:].flatten(), BINS, equal_weight=True)
 
 first_singular_value = S[0]
-other_singular_values_mean = S[1:].mean()
-other_singular_values_std = S[1:].std()
+other_singular_values_dist = BinnedDist.from_list(S[1:])
 
 # Contribution of the positional encoding of the key to the attention. Sign is + or - with equal probability
-positional_adjustment = (W_E + W_pos[-1]) @ W_Q[0,0,:,:] @ W_K[0,0,:,:].T @ (W_pos[1] - W_pos[0]).unsqueeze(0).T
-positional_adjustment_std = ((positional_adjustment**2).mean()**.5).item()
+positional_adjustment_list = (W_E + W_pos[-1]) @ W_Q[0,0,:,:] @ W_K[0,0,:,:].T @ (W_pos[1] - W_pos[0]).unsqueeze(0).T
+pos_adj_dist = BinnedDist.from_weighted_list(torch.stack([positional_adjustment_list, -positional_adjustment_list]).flatten(), BINS, equal_weight=True)
 
 if SHOW:
-    print(f"first_singular_value: {first_singular_value}\nother_singular_values_mean: {other_singular_values_mean}\nother_singular_values_std: {other_singular_values_std}")
-    print(f"positional_adjustment_std: {positional_adjustment_std}")
-    print(f"other_V_mean: {other_V_mean}\nother_V_std: {other_V_std}")
-    print(f"other_U_mean: {other_U_mean}\nother_U_std: {other_U_std}")
+    print(f"first_singular_value: {first_singular_value}")
+    other_singular_values_dist.plot()
+    plt.title("other_singular_values_dist")
+    plt.show()
+    pos_adj_dist.plot()
+    plt.title("pos_adj_dist")
+    plt.show()
+    other_V_dist.plot()
+    plt.title("other_V_dist")
+    plt.show()
+    other_U_dist.plot()
+    plt.title("other_U_dist")
+    plt.show()
+
 
 # %% [markdown]
-# Notice: Consecutive differences between projections of tokens onto key_direction are positive
 
-consec_key_diffs = key_direction[1:] - key_direction[:-1]
-consec_key_diffs_mean = consec_key_diffs.mean()
-consec_key_diffs_std = consec_key_diffs.std()
-query_proj_mean = query_direction.mean()
-query_proj_std = query_direction.std()
-if SHOW:
-    print(f"consec_key_diffs_mean: {consec_key_diffs_mean}\nconsec_key_diffs_std: {consec_key_diffs_std}\nquery_proj_mean: {query_proj_mean}\nquery_proj_std: {query_proj_std}")
-    plt.plot(consec_key_diffs.detach().cpu().numpy())
-    plt.title("Consecutive differences in the key direction")
 # %% [markdown]
 ### Calculate mean and std of difference between pre-softmax attention on $x_{max}$ and $x_{min}$.
 # Notation:
@@ -197,163 +264,60 @@ if SHOW:
 # This implies that the difference between the pre-softmax attention to the larger and smaller token streams is
 # $$t_2 \cdot USV^T \cdot (t_{max} - t_{min})^T + (-1)^{\mathbb{I}_{x_1 > x_2}} t_2 \cdot \mathrm{pos\_adjustment}$$
 # $$=\sum_{i = 1}^{d_{model}} s_i (t_2 \cdot u_i) ((t_{max} - t_{min}) \cdot v_i) + (-1)^{\mathbb{I}_{x_1 > x_2}} \mathrm{pos\_adjustment}_{x_2}$$
-#
-# We will approximate the mean and standard deviation of this value (over all choices of $x_1 \neq x_2$) by making the following assumptions:
-# - For $i = 1$
-#   - $t_2 \cdot u_1$ is an independent r.v. with mean and stdev given by the entries of the first column of $V$, i.e. `key_direction`
-#   - $(t_{max} - t_{min}) \cdot v_i$ is an independent r.v. distributed by first choosing $x_1 \neq x_2$, then randomly summing $x_{max}-x_{min}$ independent normals (each with mean and std given by consecutive differences of entries in the first column of $U$, i.e. `query_direction`).
-# - For $i > 1$:
-#   - $s_i$ is an independent r.v. with the mean and stdev of the remaining singular values.
-#   - $t_2 \cdot u_i$, $t_{max} \cdot v_i$, and $t_{min} \cdot v_i$ are independent r.v.s with means and stdevs of the non-first-column entries of $U$ and $V$, respectively.
-# - $\mathrm{pos\_adjustment}_{x_2}$ is an independent r.v. with mean and stdev of entries of $\mathrm{pos\_adjustment}$ (with a random sign). Note this means the mean is $0$.
-#
-# The following facts about the distribution of $x_{max} - x_{min}$ come in handy, where both $x_{min}, x_{max}$ are drawn uniformly from $[n]$ and we condition on $x_{min} < x_{max}$:
-# - Has mean $\frac{n+1}{3}$
-# - Has variance $\frac{n^2+n}{6}$
 
-x_diff_mean = (d_vocab + 1)/3
-x_diff_var = (d_vocab**2 + d_vocab)/6 - x_diff_mean**2
-X_mean = x_diff_mean * consec_key_diffs_mean
-X_var = x_diff_mean * consec_key_diffs_std**2 + x_diff_var * consec_key_diffs_mean**2 # Law of total variance
+# first_component_lst = [[] for _ in range(d_vocab)]
+first_component_lst = []
+for x1 in range(d_vocab):
+    for x2 in range(d_vocab):
+        if x1 == x2:
+            continue
+        x_min, x_max = min(x1, x2), max(x1, x2)
+        # first_component_lst[x_max].append(float(first_singular_value * query_direction[x2] * (key_direction[x_max] - key_direction[x_min])))
+        first_component_lst.append(float(first_singular_value * query_direction[x2] * (key_direction[x_max] - key_direction[x_min])))
+# first_component_lst[0].append(-22) # This shouldn't matter; just need it to be non-empty
+# first_component_dist = [BinnedDist.from_weighted_list(x, BINS, equal_weight=True) for x in first_component_lst]
+first_component_dist = BinnedDist.from_weighted_list(first_component_lst, BINS, equal_weight=True)
 
-presoftmax_attn_diff_mean = first_singular_value * query_proj_mean * consec_key_diffs_mean * x_diff_mean
-presoftmax_attn_diff_std = (
-    first_singular_value**2 * ((query_proj_mean**2 + query_proj_std**2) * (X_mean**2 + X_var) - query_proj_mean**2 * X_mean**2) +
-    (d_vocab-1) * (other_singular_values_mean**2 + other_singular_values_std**2) * (other_U_mean**2 + other_U_std**2) * (2 * other_V_std**2) +
-    positional_adjustment_std**2
-)**.5
+other_component_dist = other_singular_values_dist * other_U_dist * (other_V_dist - other_V_dist)
+convolved_other_component_dist = BinnedDist.convolve_n_times(other_component_dist, d_vocab - 1)
 
-# TODO: Still have to adjust for the fact that we're conditioning on $x_1 \neq x_2$.
-
-if SHOW:
-    print(f"presoftmax_attn_diff_mean: {presoftmax_attn_diff_mean}\npresoftmax_attn_diff_std: {presoftmax_attn_diff_std}")
-
-# %% [markdown]
-def visualize_error_in_presoftmax_attn_diff():
-    # Visualize how close our approximation is to the actual distribution of pre-softmax attention difference
-    def get_actual_presoftmax_attn(model, input):
-
-        if th.is_floating_point(input):
-            x = input[(None,) * (3 - input.ndim)]
-        else:
-            x = input[(None,) * (2 - input.ndim)]
-            x = th.nn.functional.one_hot(x, num_classes=model.cfg.d_vocab).float()
-
-        x = x @ model.W_E
-        x = x + model.W_pos[None, : x.shape[-2]]
-
-        Q = x[:, None] @ model.W_Q[None, 0]
-        K = x[:, None] @ model.W_K[None, 0]
-        V = x[:, None] @ model.W_V[None, 0]
-
-        return Q @ K.transpose(-2, -1)
-
-    all_attns = get_actual_presoftmax_attn(model, all_sequences).squeeze()
-    diffs = all_attns[:, 1, 0] - all_attns[:, 1, 1]
-    diffs[all_sequences[:, 0] < all_sequences[:, 1]] *= -1
-    diffs = diffs[all_sequences[:, 0] != all_sequences[:, 1]]
-
-    if SHOW:
-        print(f"actual_diff_mean: {diffs.mean()}\nactual_diff_std: {diffs.std()}")
-
-    # This is very much not normally distributed...
-
-    # Simulate our approximation
-    from random import randint, normalvariate
-    def get_draw():
-        xmin, xmax = 0, 0
-        while(xmin == xmax):
-            xmin = randint(0, d_vocab - 1)
-            xmax = randint(0, d_vocab - 1)
-        if xmin > xmax:
-            xmin, xmax = xmax, xmin
-
-        ans = first_singular_value * normalvariate(query_proj_mean, query_proj_std) * normalvariate(consec_key_diffs_mean * (xmax - xmin), consec_key_diffs_std * (xmax - xmin)**.5) # most of the work going on here
-
-        for _ in range(1, d_vocab):
-            ans += normalvariate(other_singular_values_mean, other_singular_values_std) * normalvariate(other_U_mean, other_U_std) * normalvariate(0, other_V_std * 2**.5)
-        ans += normalvariate(0, positional_adjustment_std)
-
-        return ans
-
-    draws = [get_draw() for _ in range(diffs.shape[0])]
-    draws = torch.tensor(draws)
-    if SHOW:
-        plt.hist(draws.detach().cpu().numpy(), bins=100, alpha=.5)
-        plt.hist(diffs.detach().cpu().numpy(), bins=100, alpha=.5)
-        plt.legend(["Simulated", "Actual"])
-
-# %% [markdown]
-# Functions to estimate E[f(X)] using a Taylor approximation of f around X
-from math import factorial
-from scipy.special import comb
-ell = 2 # The number of terms of the taylor expansion we're using
-
-torch.set_grad_enabled(True)
-
-
-def get_derivatives(func, num_derivatives, center):
-    if type(center) != torch.Tensor:
-        center = torch.tensor(center)
-    assert center.shape == (), "center must be a scalar"
-    center = center.clone().detach().requires_grad_(True)
-
-    derivatives = [func(center)]
-    for _ in range(1, num_derivatives + 1):
-        # Compute the i-th derivative
-        grad = torch.autograd.grad(derivatives[-1], center, create_graph=True)[0]
-        derivatives.append(grad)
-
-    return [d.item() for d in derivatives]
-
-def expected_taylor(func, num_derivatives, moments, central=False, mean=None):
-    """
-    Moments is a list of the moments of X, where moments[i] = E[(X-E[X])^i] if central==True, else moments[i] = E[X^i]. If central==True, you should also specify the mean.
-    Approximates func(x) as C_0 + C_1 (x-E[x]) + C_2 (x-E[x])^2 + ..., going up to C_{num_derivatives}. Then takes the expectation of this polynomial.
-    """
-    assert central == (mean is not None)
-    assert num_derivatives > 0
-    assert num_derivatives == len(moments)-1
-    assert moments[0] == 1
-
-    if mean is None:
-        mean = moments[1]
-
-    derivatives = get_derivatives(func, num_derivatives, mean)
-    C = [derivatives[i] / factorial(i) for i in range(num_derivatives + 1)]
-
-    if central:
-        central_moments = moments
-    else:
-        # Compute central moments from moments
-        # central_moment[i] = E[(X-E[X])^i]
-        central_moments = [1]
-        for i in range(1, num_derivatives+1):
-            central_moments.append(0)
-            for j in range(i + 1):
-                central_moments[i] += comb(i, j) * (-moments[0])**j * moments[i+1-j]
-    return sum(C[i] * central_moments[i] for i in range(num_derivatives+1))
-
-
-# %% [markdown]
-# Estimate the mean and variance of post-softmax attention
-
+# presoftmax_attn_diff_dist = [x + convolved_other_component_dist + pos_adj_dist for x in first_component_dist]
+presoftmax_attn_diff_dist = first_component_dist + convolved_other_component_dist + pos_adj_dist
 def sigmoid_neg_x(x):
     """sigmoid(-x)"""
-    return 1 / (1 + torch.exp(-x / W_K.shape[-1] ** .5))
+    return 1 / (1 + np.exp(-x / W_K.shape[-1] ** .5))
+
+# a_dist = [BinnedDist.mixture(BinnedDist.constant(1), x.apply_func(sigmoid_neg_x), 1/(2*i+1)) for i,x in enumerate(presoftmax_attn_diff_dist)]
+a_dist = BinnedDist.mixture(BinnedDist.constant(1), presoftmax_attn_diff_dist.apply_func(sigmoid_neg_x), 1/d_model) # Mixture accounts for the fact that 1/d_model of the time, x_1 = x_2.
 
 
-postsoftmax_attn_mean_before_adjust = expected_taylor(sigmoid_neg_x, ell, [1, 0, presoftmax_attn_diff_std**2], True, presoftmax_attn_diff_mean)
-postsoftmax_attn_2nd_moment_before_adjust = expected_taylor(lambda x: sigmoid_neg_x(x)**2, ell, [1, 0, presoftmax_attn_diff_std**2], True, presoftmax_attn_diff_mean)
+# %%
+from functools import partial
+def sequences_with_given_max(x_max):
+    """Returns all sequences with max = x_max"""
+    return torch.tensor([[x1, x2] for x1 in range(d_vocab) for x2 in range(d_vocab) if max(x1, x2) == x_max])
 
-# Adjust for fact that 1 / d_vocab of the time, x_1 = x_2 so the postsoftmax_attn should be 1.
-postsoftmax_attn_mean = 1 / d_vocab + (d_vocab - 1) / d_vocab * postsoftmax_attn_mean_before_adjust
-postsoftmax_attn_2nd_moment = 1 / d_vocab + (d_vocab - 1) / d_vocab * postsoftmax_attn_2nd_moment_before_adjust
-postsoftmax_attn_var = postsoftmax_attn_2nd_moment - postsoftmax_attn_mean ** 2 # Huh this might be negative
-
-
-if SHOW:
-    print(f"postsoftmax_attn_mean:{postsoftmax_attn_mean}\npostsoftmax_attn_var:{postsoftmax_attn_var}")
+def get_average_attn_on_correct(s, attn_prob):
+    if s == "attn_prob":
+        sm = []
+        for i in range(len(sequences)):
+            if sequences[i][0] == sequences[i][1]:
+                sm.append(1)
+            else:
+                sm.append(float(attn_prob[i, 0, 1, 0] if sequences[i, 0] > sequences[i, 1] else attn_prob[i, 0, 1, 1]))
+        b = BinnedDist.from_weighted_list(sm, BINS, equal_weight=True)
+        plt.plot(b.bins, label="true_dist")
+        print(b.mean())
+# forward(model, all_sequences, hook_fn=get_average_attn_on_correct)
+# max_val = 50
+# sequences = sequences_with_given_max(max_val)
+# forward(model, sequences, hook_fn=get_average_attn_on_correct)
+# plt.plot(a_dist[max_val].bins, label="estimated_dist")
+sequences = all_sequences
+forward(model, sequences, hook_fn=get_average_attn_on_correct)
+plt.plot(a_dist.bins, label="estimated_dist")
+plt.legend()
+plt.title("Attention on correct token")
 
 # %% [markdown]
 # Notice: EVOU is basically identity
@@ -381,67 +345,122 @@ if SHOW:
 
 
 # %% [markdown]
-# Make necessary binned distributions
-BINS = 100
-resids = []
-for i in range(EVOU.shape[0]):
-    for j in range(EVOU.shape[1]):
-        if i != j:
-            resids.extend([(EVOU[i, j] - EVOU[i, i]).item()] * (2*i+1))
-evou_resid_dist = BinnedDist.from_list(resids, BINS)
-evou_off_diag_dist = BinnedDist.from_list(list(off_diagonal), BINS)
-EU = W_E @ W_U
-EU.squeeze_()
-eu_dist = BinnedDist.from_list(list(EU.flatten().detach().numpy()), BINS)
+# Analytically-calculated probabilities of (i, j, k)
+# i is max, j is min, k is something that is not i
+def prob_ijk(i = None, j = None, k = None):
+    """
+    returns probability of (i, j, k) under the following distribution:
+    x1, x2 ~ [d_vocab]
+    i = max(x1, x2)
+    j = min(x1, x2)
+    k ~ [d_vocab] \ {i}
+    """
+    assert i is None or (i >= 0 and i < d_vocab)
+    assert j is None or (j >= 0 and j < d_vocab)
+    assert k is None or (k >= 0 and k < d_vocab)
+    assert i is not None or j is not None or k is not None
 
-pos_enc_contrib_through_attention_dist = BinnedDist.from_list(list((W_pos @ W_V @ W_O @ W_U).flatten().detach().numpy()), BINS)
-evou_dist = BinnedDist.from_list(list(EVOU.flatten().detach().numpy()), BINS)
-evou_diag_dist = BinnedDist.from_list(list(EVOU.diag().detach().numpy()), BINS)
+    non_none = ("i" if i is not None else "") + ("j" if j is not None else "") + ("k" if k is not None else "")
+
+    if non_none == "i":
+        return (2*i + 1) / d_vocab**2
+    elif non_none == "ij":
+        if j > i: return 0
+        if i == j: return 1 / d_vocab**2
+        return 2 / d_vocab**2
+    elif non_none == "j":
+        return (2*(d_vocab - 1 - j) + 1) / d_vocab**2
+    elif non_none == "k":
+        return (d_vocab**2 - (2*k+1)) / d_vocab**2 / (d_vocab - 1)
+    elif non_none == "jk":
+        raise NotImplementedError # seems annoying; i'll do this later
+    elif non_none in ["ik", "ijk"]:
+        if i == k: return 0
+        return prob_ijk(i, j, None) / (d_vocab - 1)
+
+
+# %% [markdown]
+# Make necessary binned distributions
+
+weighted_lsts = {}
+
+# pe2Ui: The direct contribution of positional encoding to the correct logit (doesn't go through attention)
+weighted_lsts["P2Ui"] = [(float(x), prob_ijk(i=i)) for i, x in enumerate(W_pos[1] @ W_U)]
+
+# pe2Uk: The direct contribution of positional encoding to an incorrect logit (doesn't go through attention)
+weighted_lsts["P2Uk"] = [(float(x), prob_ijk(k=k)) for k, x in enumerate(W_pos[1] @ W_U)]
+
+EU = W_E @ W_U
+# EUx2i: The contribution of the embedding of x2 to the correct logit (doesn't go through attention)
+weighted_lsts["EUx2i"] = []
+for x1 in range(d_vocab):
+    for x2 in range(d_vocab):
+        weighted_lsts["EUx2i"].append((float(EU[x2, max(x1, x2)]), 1/d_vocab**2))
+
+# EUx2k: The contribution of the embedding of x2 to an incorrect logit (doesn't go through attention)
+weighted_lsts["EUx2k"] = []
+for x2 in range(d_vocab):
+    for k in range(d_vocab):
+        weighted_lsts["EUx2k"].append((float(EU[x2, k]), 1/d_vocab**2))    # This isn't exact; actually x2 is correlated with k
+
+# big_attention: The contribution of the attention to x_max to an incorrect logit - the correct logit. Before being multiplied by A
+weighted_lsts["big_attention"] = []
+
+for loc_max in [0, 1]:
+    Ploc_maxVOU = (W_pos[loc_max] @ W_V @ W_O @ W_U).squeeze()
+    for i in range(d_vocab):
+        for k in range(d_vocab):
+            weighted_lsts["big_attention"].append((float(EVOU[i,k] + Ploc_maxVOU[k] - (EVOU[i,i] + Ploc_maxVOU[i])), prob_ijk(i=i, k=k) / 2))
+
+# small_attention: The contribution of the attention to x_min to an incorrect logit - the correct logit. Before being multiplied by (1-A)
+weighted_lsts["small_attention"] = []
+
+# This takes O(n^3)
+for loc_min in [0, 1]:
+    Ploc_maxVOU = (W_pos[loc_max] @ W_V @ W_O @ W_U).squeeze()
+    for j in range(d_vocab):
+        for i in range(d_vocab):
+            for k in range(d_vocab):
+                weighted_lsts["small_attention"].append(
+                    (float(EVOU[j,k] + Ploc_maxVOU[k] - (EVOU[j,i] + Ploc_maxVOU[i])), prob_ijk(i=i, j=j, k=k) / 2))
+
+# %%
+dists = {}
+for key, value in weighted_lsts.items():
+    dists[key] = BinnedDist.from_weighted_list(value, BINS)
+
 # %% [markdown]
 # Estimate the final output distribution
-
 import scipy.stats as stats
 
-torch.set_grad_enabled(False)
-if postsoftmax_attn_var <= 0: # Handle degenerate case
-    # a_dist = BinnedDist.from_cdf(lambda x: 1 if x>=postsoftmax_attn_mean else 0, BINS, float(postsoftmax_attn_mean-1e-6), float(postsoftmax_attn_mean+1e-6))
-    a_dist = BinnedDist.from_normal(float(postsoftmax_attn_mean), float(1e-6), BINS)
-else:
-    a_dist = BinnedDist.from_normal(postsoftmax_attn_mean, postsoftmax_attn_var**.5, BINS)
-#     a_dist = BinnedDist.from_cdf(lambda x: stats.norm.cdf(x, loc=postsoftmax_attn_mean, scale=postsoftmax_attn_var**.5), BINS, float(postsoftmax_attn_mean - 10 * (postsoftmax_attn_var**.5)), float(postsoftmax_attn_mean + 10 * (postsoftmax_attn_var**.5)))
-
-correct_logit_dist = evou_off_diag_dist.convolve_with(pos_enc_dist).apply_func2(lambda x, a: x*(1-a), a_dist).convolve_with(eu_dist)
-incorrect_logit_dist = evou_resid_dist.convolve_with(pos_enc_dist).apply_func2(lambda x, a: x*a, a_dist).convolve_with(
-    evou_dist.convolve_with(pos_enc_dist).apply_func2(lambda x, a: x*(1-a), a_dist)
-).convolve_with(eu_dist)
-
+correct_logit_dist = dists["EUx2i"] + dists["P2Ui"]
+incorrect_logit_dist = dists["big_attention"].apply_func2(lambda x, a: x*a, a_dist) + dists["small_attention"].apply_func2(lambda x, a: x*(1-a), a_dist) + dists["EUx2k"] + dists["P2Uk"]
 
 exp_correct_logit_dist = correct_logit_dist.apply_func(np.exp)
 exp_incorrect_logit_dist = incorrect_logit_dist.apply_func(np.exp)
-
-
-
-# Now, convolve exp_incorrect_logit_dist with itself d_vocab-1 times, using binary lifting
-to_convolve = []
-curr_dist = exp_incorrect_logit_dist
-curr_power = 1
-while curr_power <= (d_vocab-1):
-    if curr_power & (d_vocab-1):
-        to_convolve.append(curr_dist)
-    curr_dist = curr_dist.convolve_with(curr_dist)
-    curr_power <<= 1
-while len(to_convolve) > 1:
-    to_convolve.append(to_convolve.pop().convolve_with(to_convolve.pop()))
-convolved_exp_incorrect_logit_dist = to_convolve[0]
+convolved_exp_incorrect_logit_dist = BinnedDist.convolve_n_times(exp_incorrect_logit_dist, d_vocab-1)
 
 final_output_dist = exp_correct_logit_dist.apply_func2(lambda a, b: a/(a+b), convolved_exp_incorrect_logit_dist)
 
 if SHOW:
     final_output_dist.plot()
     plt.title("Estimated Final output distribution")
+    plt.show()
     print(f"estimated accuracy: {final_output_dist.mean()}")
 
+    # Model's accuracy
+    probs = th.nn.functional.softmax(forward(model, all_sequences), dim=-1)[:, -1]
+    problst = probs[th.arange(len(all_sequences)), all_sequences.max(-1).values].tolist()
+    true_dist = BinnedDist.from_weighted_list(problst, BINS, equal_weight=True)
+    true_dist.plot()
+
 # %%
+plt.plot(final_output_dist.bins, label="estimated")
+plt.plot(true_dist.bins, label="true")
+plt.legend()
+plt.title("Estimated vs true final soft accuracy distribution (inverse CDF)")
+# %%
+# Below is scratch to debug error between true and estimate
 
 def forward_attn_1(model, input, *, hook_fn=None):
     """Assume attention is always correctly placed 100% on correct token"""
@@ -475,7 +494,6 @@ def forward_attn_1(model, input, *, hook_fn=None):
     # places 1 attn on correct answer
     attn_1[:, 0, 1, 0] = all_sequences[:, 0] > all_sequences[:, 1]
     attn_1[:, 0, 1, 1] = all_sequences[:, 0] <= all_sequences[:, 1]
-
 
     # attn = masked_softmax(Q @ K.transpose(-2, -1) / d_k**0.5) @ V
     attn = attn_1 @ V
@@ -532,6 +550,19 @@ def no_pos_independent_k():
     return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
 trials = 10000
 sum([no_pos_independent_k() for _ in range(trials)]) / trials # also 92%, so not a source of error.
+# %%
+def no_pos_independent_k_from_i_from_dist():
+    x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
+    i, j = max(x1, x2), min(x1, x2)
+    correct_logit = 0
+    incorrect_logits = []
+    for _ in range(d_vocab-1):
+        ip = max(randint(0, d_vocab-1), randint(0, d_vocab-1))
+        k = (randint(1, d_vocab-1) + ip)%d_vocab
+        incorrect_logits.append(EVOU[ip,k] - EVOU[ip, ip])
+    return np.exp(correct_logit) / (np.exp(correct_logit) + sum(np.exp(incorrect_logits)))
+
+sum([no_pos_independent_k_from_i_from_dist() for _ in range(trials)]) / trials #85%
 # %%
 def no_pos_independent_k_from_i():
     x1, x2 = randint(0, d_vocab-1), randint(0, d_vocab-1)
