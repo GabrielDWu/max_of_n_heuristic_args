@@ -35,25 +35,26 @@ D_HEAD = 32 # @param
 D_MLP = None # @param
 D_VOCAB = 64 # @param
 SEED = 123 # @param
-N_CTX = 2 # @param
+# N_CTX = 2 # @param
 DEVICE = "cuda" if torch.cuda.is_available() and not DETERMINISTIC else "cpu"
 
-MODEL_INFO = {'2-1500': ('tkwa-team', 1500), '2-32': ('team-jason', 32)}
+MODEL_INFO = {'2-1500': ('tkwa-team', 2, 1500, None), '2-32': ('team-jason', 2, 32, None), '5-9950': ('team-jason', 5, 9950, None), '10-15000': ('gbmi', 10, 15000, 'gbmi/MaxOf10-15000-steps/MaxOf10-15000-steps-000f7a99e169b7af5379555a5b95071e:v0')}
 
 def get_model(model_id):
     """
     '2-1500': overtrained, max-of-2, 1500 epochs
     '2-32': undertrained, max-of-2, 32 epochs
+    '5-9950': overtrained, max-of-10, 9950 epochs
     """
 
-    wandb_entity, n_epochs = MODEL_INFO[model_id]
+    wandb_entity, n_ctx, n_epochs, wandb_model_path = MODEL_INFO[model_id]
 
     simpler_cfg = HookedTransformerConfig(
         d_model=D_MODEL,
         n_layers=N_LAYERS,
         n_heads=N_HEADS,
         d_head=D_HEAD,
-        n_ctx=N_CTX,
+        n_ctx=n_ctx,
         d_vocab=D_VOCAB,
         seed=SEED,
         device=DEVICE,
@@ -67,8 +68,9 @@ def get_model(model_id):
         if "b_" in name:
             param.requires_grad = False
 
-    model_name = f'neural-net-coq-interp-max-{model.cfg.n_ctx}-epochs-{n_epochs}'
-    wandb_model_path = f"{wandb_entity}/{model_name}/{model_name}:latest"
+    if wandb_model_path is None:
+        model_name = f'neural-net-coq-interp-max-{model.cfg.n_ctx}-epochs-{n_epochs}'
+        wandb_model_path = f"{wandb_entity}/{model_name}/{model_name}:latest"
     model_dir = None
     try:
         api = wandb.Api()
@@ -93,6 +95,18 @@ def get_model(model_id):
 
 
 def generate_all_sequences(n_digits: int, sequence_length: int = 2):
-  data = list(itertools.product(range(n_digits), repeat=sequence_length))
-  data = torch.tensor(data)
-  return data
+    total_length = n_digits ** sequence_length
+    assert total_length < 1e6, "Too many sequences to generate, use generate_some_sequences instead"
+    data = list(itertools.product(range(n_digits), repeat=sequence_length))
+    data = torch.tensor(data)
+    return data
+  
+def generate_some_sequences(n_digits: int, sequence_length: int = 2, cnt=5000, unique=False):
+    """
+    unique: if True, will make sure each sequence has all of its entries unique
+    """
+    if not unique:
+        return torch.randint(0, n_digits, (cnt, sequence_length))
+    else:
+        return torch.stack([torch.randperm(n_digits)[:sequence_length] for _ in range(cnt)])
+    
