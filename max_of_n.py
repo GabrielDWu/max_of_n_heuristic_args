@@ -3,9 +3,8 @@ from collections import defaultdict
 from utils_cleaned import *
 import torch as th
 !wandb login --anonymously
+# model = get_model('10-400')
 model = get_model('10-15000')
-# model = get_model('5-9950')
-# model = get_model('2-32')
 
 torch.set_grad_enabled(False)
 # %%
@@ -82,6 +81,7 @@ print("Soft Accuracy:", float(probs[th.arange(len(sequences)), sequences.max(-1)
 # Get a heuristic estimate for the (soft) accuracy of the model
 SHOW = False
 BINS = 10
+d_model, d_vocab, n_ctx = model.cfg.d_model, model.cfg.d_vocab, model.cfg.n_ctx
 
 
 # %%
@@ -101,25 +101,22 @@ class BinnedDist:
         self.bins = np.array(bins if bins is not None else [0]*num_bins)
 
     @staticmethod
-    def from_list(lst):
+    def from_list(lst, num_bins = None):
         assert len(lst) > 0
-        num_bins = len(lst)
-        lst = np.sort(lst)
-        bins = np.array(lst)
-        return BinnedDist(num_bins, bins)
+        lst = [(x, 1/len(lst)) for x in lst]
+        if num_bins is None and len(lst) < BINS: num_bins = len(lst)
+        else: num_bins = BINS
+        return BinnedDist.from_weighted_list(lst, num_bins)
 
     @staticmethod
-    def from_weighted_list(lst, num_bins, equal_weight=False):
-        """lst is a bunch of pairs (x, w) where x is a number and w is its weight.
-        when equal_weight=True, lst is just the x values"""
+    def from_weighted_list(lst, num_bins):
+        """lst is a bunch of pairs (x, w) where x is a number and w is its weight."""
         assert len(lst) > 0
-        if equal_weight:
-            lst = [(x, 1/len(lst)) for x in lst]
-        else:
-            # normalize weights
-            total_weight = sum(w for _, w in lst)
-            for i in range(len(lst)):
-                lst[i] = (lst[i][0], lst[i][1] / total_weight)
+
+        # normalize weights
+        total_weight = sum(w for _, w in lst)
+        for i in range(len(lst)):
+            lst[i] = (lst[i][0], lst[i][1] / total_weight)
 
         lst = sorted(lst)
         bins = np.zeros(num_bins)
@@ -160,19 +157,13 @@ class BinnedDist:
     def constant(c):
         return BinnedDist(1, np.array([c]))
     
-    # @staticmethod
-    # def mixture(bd1: 'BinnedDist', bd2: 'BinnedDist', p, num_bins=None):
-    #     """Mixture of bd1 and bd2, with probability p of bd1 and 1-p of bd2"""
-    #     weighted_lst = [(x, p / bd1.num_bins) for x in bd1.bins] + [(x, (1-p) / bd2.num_bins) for x in bd2.bins]
-    #     return BinnedDist.from_weighted_list(weighted_lst, num_bins=num_bins if num_bins is not None else max(bd1.num_bins, bd2.num_bins))
-    
     @staticmethod
     def mixture(dists: list[tuple['BinnedDist', float]], num_bins=None):
         """Mixture of dists[i][0] with probability dists[i][1]"""
         weighted_lst = []
         for dist, p in dists:
             weighted_lst += [(x, p / dist.num_bins) for x in dist.bins]
-        return BinnedDist.from_weighted_list(weighted_lst, num_bins=num_bins if num_bins is not None else max(dist.num_bins for dist, _ in dists))
+        return BinnedDist.from_weighted_list(weighted_lst, num_bins=num_bins if num_bins is not None else BINS)
     
     def plot(self, **kwargs):
         xs = self.bins
@@ -190,7 +181,7 @@ class BinnedDist:
         all_pairs = func(x, y)
         all_pairs_flat = all_pairs.flatten()
         bin_count = new_bin_cnt if new_bin_cnt is not None else min(len(all_pairs_flat), BINS)
-        return BinnedDist.from_weighted_list(all_pairs_flat, bin_count, equal_weight=True)
+        return BinnedDist.from_list(all_pairs_flat, bin_count)
 
     def __add__(self, other):
         return self.apply_func2(np.add, other)
@@ -226,52 +217,14 @@ def prob_x_max(x_max):
     """Returns probability of max = x_max"""
     return comb(x_max, n_ctx-1) / comb(d_vocab, n_ctx)
 
-# %% [markdown]
-# Õ(n^3) estimate
+def prob_x_last_given_x_max(x_max, x_last):
+    """Returns probability of x_last given max = x_max"""
+    if x_last > x_max:
+        return 0
+    if x_last == x_max:
+        return 1 / n_ctx
+    return (n_ctx - 1) / n_ctx / x_max
 
-def estimate_slow(model):
-
-    W_U, W_E, W_pos, W_V, W_O = model.W_U, model.W_E, model.W_pos, model.W_V, model.W_O
-    W_Q, W_K= model.W_Q, model.W_K
-    d_model, d_vocab, n_ctx = model.cfg.d_model, model.cfg.d_vocab, model.cfg.n_ctx
-
-    accuracies = []
-
-    EQKE = (W_E + W_pos[-1]) @ W_Q[0, 0, :, :] @ W_K[0, 0, :, :].T @ (W_E).T
-    EQKP = (W_E + W_pos[-1]) @ W_Q[0, 0, :, :] @ W_K[0, 0, :, :].T @ (W_pos).T
-    EVOU = W_E @ W_V[0, 0, :, :] @ W_O[0, 0, :, :] @ W_U
-    PVOU = W_pos @ W_V[0, 0, :, :] @ W_O[0, 0, :, :] @ W_U
-    EU = W_E @ W_U
-    PU = W_pos @ W_U
-
-    pos_contrib_through_vou = [BinnedDist.from_list(PVOU[:, ell]) for ell in range(d_vocab)]
-    lower_contrib = [[BinnedDist.from_list(EVOU[:x_max, ell]) if x_max > 0 else None for ell in range(d_vocab)] for x_max in range(d_vocab)]
-
-    for x_last in range(d_vocab):
-
-        pos_noise_in_attn = BinnedDist.from_list(EQKP[x_last, :])
-
-        for x_max in range(n_ctx-1, d_vocab):
-
-            presoftmax_good_attn = BinnedDist.constant(EQKE[x_last, x_max]) + pos_noise_in_attn
-            presoftmax_bad_attn = BinnedDist.from_list(EQKE[x_last, :x_max]) + pos_noise_in_attn
-            exp_presoftmax_good_attn = presoftmax_good_attn.apply_func(np.exp)
-            exp_presoftmax_bad_attn = presoftmax_bad_attn.apply_func(np.exp)
-            good_attn = exp_presoftmax_good_attn.apply_func2(lambda a, b: a/(a+b), exp_presoftmax_bad_attn.convolve_n_times(n_ctx-1))
-            bad_attn = exp_presoftmax_bad_attn.apply_func2(lambda a, b: a/(a+b), exp_presoftmax_good_attn+exp_presoftmax_bad_attn.convolve_n_times(n_ctx-2))
-
-            logits = [None] * d_vocab
-            exp_logits = [None] * d_vocab
-            for ell in range(d_vocab):
-                logits[ell] = good_attn * (BinnedDist.constant(EVOU[x_max, ell]) + pos_contrib_through_vou[ell]) + (bad_attn * (lower_contrib[x_max][ell] + pos_contrib_through_vou[ell])).convolve_n_times(n_ctx-1) + BinnedDist.constant(EU[x_last, ell] + PU[n_ctx-1, ell])
-                exp_logits[ell] = logits[ell].apply_func(np.exp)
-            
-            acc = exp_logits[x_max].apply_func2(lambda a, b: a/(a+b), sum(exp_logits[:x_max] + exp_logits[x_max+1:], start=BinnedDist.constant(0)))
-
-            accuracies.append((acc, prob_x_max(x_max)))
-
-    overall_acc = BinnedDist.mixture(accuracies)
-    return overall_acc.mean()
 # %% [markdown]
 # Õ(n^2) + O(n^3) estimate; joining on x_last
 
@@ -279,7 +232,6 @@ def estimate(model):
 
     W_U, W_E, W_pos, W_V, W_O = model.W_U, model.W_E, model.W_pos, model.W_V, model.W_O
     W_Q, W_K= model.W_Q, model.W_K
-    d_model, d_vocab, n_ctx = model.cfg.d_model, model.cfg.d_vocab, model.cfg.n_ctx
 
     accuracies = []
 
@@ -291,33 +243,66 @@ def estimate(model):
     PU = W_pos @ W_U
 
     pos_contrib_through_vou = [BinnedDist.from_list(PVOU[:, ell]) for ell in range(d_vocab)]
-    lower_contrib = [[BinnedDist.from_list(EVOU[:x_max, ell]) if x_max > 0 else None for ell in range(d_vocab)] for x_max in range(d_vocab)]
-    resid_stream_contrib = [BinnedDist.from_list(EU[:, ell]) for ell in range(d_vocab)]
+
+    # EVOU_prefix[x_max][ell] is the distribution of EVOU[:x_max, ell]
+    EVOU_prefix = [[None] * d_vocab for x_max in range(d_vocab)]
+    # EU_prefix[x_max][ell] is the distribution of EU[:x_max, ell]
+    EU_prefix = [[None] * d_vocab for x_max in range(d_vocab)]
+    for ell in range(d_vocab):
+        EVOU_prefix[1][ell] = BinnedDist.constant(EVOU[0, ell])
+        EU_prefix[1][ell] = BinnedDist.constant(EU[0, ell])
+        for i in range(1, d_vocab-1):
+            EVOU_prefix[i+1][ell] = BinnedDist.mixture([(EVOU_prefix[i][ell], i/(i+1)), (BinnedDist.constant(EVOU[i, ell]), 1/(i+1))])
+            EU_prefix[i+1][ell] = BinnedDist.mixture([(EU_prefix[i][ell], i/(i+1)), (BinnedDist.constant(EU[i, ell]), 1/(i+1))])
 
     good_attn = [[] for i in range(d_vocab)]
     bad_attn = [[] for i in range(d_vocab)]
 
     for x_last in range(d_vocab):
 
-        pos_noise_in_attn = BinnedDist.from_list(EQKP[x_last, :])
+        pos_noise_nonlast = BinnedDist.from_list(EQKP[x_last, :-1])
+        pos_noise_last = BinnedDist.constant(EQKP[x_last, -1])
+        pos_noise_mixture = BinnedDist.mixture([(pos_noise_nonlast, (n_ctx-2)/(n_ctx-1)), (pos_noise_last, 1/(n_ctx-1))])
+
+        prefix_dists = [None] * d_vocab
+        prefix_dists[1] = BinnedDist.constant(EQKE[x_last, 0])
+        for i in range(1, d_vocab-1):
+            prefix_dists[i+1] = BinnedDist.mixture([(prefix_dists[i], i/(i+1)), (BinnedDist.constant(EQKE[x_last, i]), 1/(i+1))], num_bins=BINS)
+
 
         for x_max in range(n_ctx-1, d_vocab):
+            if x_last > x_max:
+                continue
 
-            presoftmax_good_attn = BinnedDist.constant(EQKE[x_last, x_max]) + pos_noise_in_attn
-            presoftmax_bad_attn = BinnedDist.from_list(EQKE[x_last, :x_max]) + pos_noise_in_attn
+            if x_last == x_max:
+                pos_noise_in_good_attn = pos_noise_last
+                pos_noise_in_bad_attn = pos_noise_nonlast
+            else:
+                pos_noise_in_good_attn = pos_noise_nonlast
+                pos_noise_in_bad_attn = pos_noise_mixture
+
+            presoftmax_good_attn = BinnedDist.constant(EQKE[x_last, x_max]) + pos_noise_in_good_attn
+            presoftmax_bad_attn = prefix_dists[x_max] + pos_noise_in_bad_attn
             exp_presoftmax_good_attn = presoftmax_good_attn.apply_func(np.exp)
             exp_presoftmax_bad_attn = presoftmax_bad_attn.apply_func(np.exp)
-            good_attn[x_max].append(exp_presoftmax_good_attn.apply_func2(lambda a, b: a/(a+b), exp_presoftmax_bad_attn.convolve_n_times(n_ctx-1)))
-            bad_attn[x_max].append(exp_presoftmax_bad_attn.apply_func2(lambda a, b: a/(a+b), exp_presoftmax_good_attn+exp_presoftmax_bad_attn.convolve_n_times(n_ctx-2)))
+
+            conditional_prob = prob_x_last_given_x_max(x_max, x_last)
+            good_attn[x_max].append((exp_presoftmax_good_attn.apply_func2(lambda a, b: a/(a+b), exp_presoftmax_bad_attn.convolve_n_times(n_ctx-1)), conditional_prob))
+            bad_attn[x_max].append((exp_presoftmax_bad_attn.apply_func2(lambda a, b: a/(a+b), exp_presoftmax_good_attn+exp_presoftmax_bad_attn.convolve_n_times(n_ctx-2)), conditional_prob))
+
 
     for x_max in range(n_ctx-1, d_vocab):
 
         logits = [None] * d_vocab
         exp_logits = [None] * d_vocab
-        good_attn_marginalized = BinnedDist.mixture([(good_attn[x_max][x_last], 1 / d_vocab) for x_last in range(d_vocab)])
-        bad_attn_marginalized = BinnedDist.mixture([(bad_attn[x_max][x_last], 1 / d_vocab) for x_last in range(d_vocab)])
+        good_attn_marginalized = BinnedDist.mixture(good_attn[x_max])
+        bad_attn_marginalized = BinnedDist.mixture(bad_attn[x_max])
         for ell in range(d_vocab):
-            logits[ell] = good_attn_marginalized * (BinnedDist.constant(EVOU[x_max, ell]) + pos_contrib_through_vou[ell]) + (bad_attn_marginalized * (lower_contrib[x_max][ell] + pos_contrib_through_vou[ell])).convolve_n_times(n_ctx-1) + resid_stream_contrib[ell] + BinnedDist.constant(PU[n_ctx-1, ell])
+            resid_stream_contrib = BinnedDist.mixture([(EU_prefix[x_max][ell], (n_ctx-1)/n_ctx), (BinnedDist.constant(EU[x_max, ell]), 1/n_ctx)]) + BinnedDist.constant(PU[n_ctx-1, ell]) 
+
+            logits[ell] = good_attn_marginalized * (BinnedDist.constant(EVOU[x_max, ell]) + pos_contrib_through_vou[ell]) \
+                + (bad_attn_marginalized * (EVOU_prefix[x_max][ell] + pos_contrib_through_vou[ell])).convolve_n_times(n_ctx-1) \
+                + resid_stream_contrib
             exp_logits[ell] = logits[ell].apply_func(np.exp)
         
         acc = exp_logits[x_max].apply_func2(lambda a, b: a/(a+b), sum(exp_logits[:x_max] + exp_logits[x_max+1:], start=BinnedDist.constant(0)))
@@ -329,7 +314,12 @@ def estimate(model):
     return overall_acc.mean()
 
 # %%
-TRIALS = 80
+################################
+# Experiments below this point #
+################################
+
+TRIALS = 10
+data = []
 for i in range(TRIALS):
     # make a copy of model
     model = get_model('10-15000')
@@ -338,6 +328,7 @@ for i in range(TRIALS):
 
     print(f"Trial {i+1}:")
     est = estimate(model)
+    sequences = generate_some_sequences(model.cfg.d_vocab, model.cfg.n_ctx, unique=True, cnt=10000)
     probs = th.nn.functional.softmax(forward(model, sequences), dim=-1)[:, -1]
     gt = float(probs[th.arange(len(sequences)), sequences.max(-1).values].mean())
 
@@ -346,11 +337,22 @@ for i in range(TRIALS):
     data.append((gt, est))
 
 # %%
+# read in data from noised_data.txt
+# data = []
+# with open('noised_data_v4.txt', 'r') as f:
+#     f.readline()
+#     for line in f:
+#         gt, est = line.split()
+#         data.append((float(gt), float(est)))
+
+# %%
 # plot data
 plt.plot([x for x, _ in data], [y for _, y in data], 'o')
 # plot line of best fit
 m, b = np.polyfit([x for x, _ in data], [y for _, y in data], 1)
-plt.plot([x for x, _ in data], [m*x + b for x, _ in data])
+plt.plot([x for x, _ in data], [m*x + b for x, _ in data], 'g')
+plt.plot([x for x, _ in data], [x for x, _ in data])
+plt.legend(["Samples", "Best fit", "y=x"])
 plt.xlabel("Actual accuracy")
 plt.ylabel("Estimated accuracy")
 plt.show()
@@ -358,3 +360,62 @@ plt.show()
 
 # %%
 sum((x-y) for x, y in data) / len(data)
+# %%
+plt.hist([x-y for x, y in data], bins=10)
+# %%
+# Write data to a file
+with open('noised_data_v4.txt', 'w') as f:
+    f.write("Actual Estimated\n")
+    for x, y in data:
+        f.write(f"{x} {y}\n")
+
+# %%
+TRIALS = 5
+bin_cnts = [1, 2, 3, 4, 5, 10, 20, 30, 40]
+estimates = [[0] * len(bin_cnts) for t in range(TRIALS)]
+for t in range(TRIALS):
+    model = get_model('10-15000')
+    torch.seed()
+    perturb(model, .1)
+    for i, x in enumerate(bin_cnts):
+        BINS = x
+        estimates[t][i] = estimate(model)
+        print(f"Estimate with {x} bins: {estimates[t][i]}")
+
+# %%
+for t in range(TRIALS):
+    # make dots bigger, but also include lines
+    plt.plot(bin_cnts, estimates[t], 'o-')
+plt.xlabel("b (number of bins)")
+plt.ylabel("Estimated accuracy")
+
+# %%
+# Write data to a file
+with open('bins.txt', 'w') as f:
+    f.write("trial b Estimate\n")
+    for t in range(TRIALS):
+        for i, x in enumerate(bin_cnts):
+            f.write(f"{t} {x} {estimates[t][i]}\n")
+# %%
+# Compare output distributions
+model = get_model('10-15000')
+perturb(model, .1)
+
+BINS = 10
+_, accuracies, good_attn, bad_attn = estimate(model)
+
+# %%
+BINS = 1000
+acc = BinnedDist.mixture(accuracies)
+
+sequences = generate_some_sequences(model.cfg.d_vocab, model.cfg.n_ctx, unique=True, cnt=100000)
+probs = th.nn.functional.softmax(forward(model, sequences), dim=-1)[:, -1]
+gt_dist = BinnedDist.from_list(probs[th.arange(len(sequences)), sequences.max(-1).values]
+, 1000)
+# %%
+plt.plot(gt_dist.bins)
+plt.plot(acc.bins)
+plt.legend(["Ground truth", "Estimated"])
+# %%
+acc.plot()
+gt_dist.plot()

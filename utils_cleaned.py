@@ -38,13 +38,15 @@ SEED = 123 # @param
 # N_CTX = 2 # @param
 DEVICE = "cuda" if torch.cuda.is_available() and not DETERMINISTIC else "cpu"
 
-MODEL_INFO = {'2-1500': ('tkwa-team', 2, 1500, None), '2-32': ('team-jason', 2, 32, None), '5-9950': ('team-jason', 5, 9950, None), '10-15000': ('gbmi', 10, 15000, 'gbmi/MaxOf10-15000-steps/MaxOf10-15000-steps-000f7a99e169b7af5379555a5b95071e:v0')}
+MODEL_INFO = {'2-1500': ('tkwa-team', 2, 1500, None), '2-32': ('team-jason', 2, 32, None), '5-9950': ('team-jason', 5, 9950, None), '10-15000': ('gbmi', 10, 15000, 'gbmi/MaxOf10-15000-steps/MaxOf10-15000-steps-000f7a99e169b7af5379555a5b95071e:v0'), '10-400': ('gbmi', 10, 400, 'gbmi/MaxOf10-400-steps/MaxOf10-400-steps-00746f3262bc3dfcba65c0dc63dca5cd:latest')}
 
 def get_model(model_id):
     """
     '2-1500': overtrained, max-of-2, 1500 epochs
     '2-32': undertrained, max-of-2, 32 epochs
     '5-9950': overtrained, max-of-10, 9950 epochs
+    '10-15000': overtrained, max-of-10, 15000 epochs
+    '10-400': undertrained, max-of-10, 400 epochs
     """
 
     wandb_entity, n_ctx, n_epochs, wandb_model_path = MODEL_INFO[model_id]
